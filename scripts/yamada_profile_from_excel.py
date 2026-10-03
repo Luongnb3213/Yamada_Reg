@@ -32,7 +32,6 @@ PROFILE_KEYS = [
     "dob",
     "gender",
     "password",
-    "auth_code",
     "otp_inbox",
     "otp_password",
     "otp_imap_host",

@@ -35,7 +35,6 @@ INPUT_HEADERS = [
     "dob",
     "gender",
     "password",
-    "auth_code",
     "otp_inbox",
     "otp_password",
     "otp_imap_host",
@@ -190,7 +189,10 @@ STATUS_MAP = {
     "failed": "FAILED",
     "error": "FAILED",
     "fail_no_retry": "FAIL_NO_RETRY",
+    "fail_no_rety": "FAIL_NO_RETRY",
     "aborted": "FAIL_NO_RETRY",
+    "logg_in": "LOGG_IN",
+    "logged_in": "LOGG_IN",
 }
 
 

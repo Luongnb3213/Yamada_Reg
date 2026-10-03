@@ -23,12 +23,21 @@ from src.connections.xlsx_connection import normalize_status  # noqa: E402
 from yamada_profile_from_excel import cell_text, normalize_header  # noqa: E402
 
 
-STOP_ON_ERROR_HINTS = (
+HARD_DEVICE_LOST_HINTS = (
     "Frida chưa thấy iPhone USB",
     "device not found",
+)
+
+ROW_INFRA_ERROR_HINTS = (
     "unable to find process",
     "Không có CraneManager",
     "CraneManager unavailable",
+    "this feature requires an iOS Developer Disk Image",
+    "the connection is closed",
+    "tLS connection closed unexpectedly",
+)
+
+GLOBAL_ERROR_HINTS = (
     "Excel appears to be open/locked",
 )
 
@@ -143,9 +152,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wait-timeout-ms", type=int, default=15000)
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--device-id", default=os.environ.get("FRIDA_DEVICE_ID", "auto"), help="'auto', 'all', or comma-separated Frida device IDs.")
-    parser.add_argument("--no-reload", action="store_true")
+    parser.add_argument("--no-reload", action="store_true", help="Deprecated/default. Crane reload is already disabled by full-flow.")
+    parser.add_argument("--reload-crane", action="store_true", help="Opt in to Crane reloadApplicationWithIdentifier after switching container.")
     parser.add_argument("--no-submit", action="store_true")
     parser.add_argument("--max-attempts", type=int, default=2, help="Max attempts per row, including the first run.")
+    parser.add_argument("--device-error-threshold", type=int, default=1, help="Disable a device after this many consecutive hard lost-device errors.")
+    parser.add_argument("--soft-infra-cooldown-sec", type=float, default=15.0, help="Sleep this many seconds after Crane/DDI/connection errors before the device takes another row.")
+    parser.add_argument("--device-start-gap-sec", type=float, default=2.0, help="Stagger worker start times to avoid hitting all USB/Frida devices at once.")
     parser.add_argument("--list-only", action="store_true")
     return parser
 
@@ -161,6 +174,15 @@ def main() -> int:
         return 1
     if args.max_attempts < 1:
         print("[batch] max-attempts phải >= 1.", file=sys.stderr, flush=True)
+        return 1
+    if args.device_error_threshold < 1:
+        print("[batch] device-error-threshold phải >= 1.", file=sys.stderr, flush=True)
+        return 1
+    if args.soft_infra_cooldown_sec < 0:
+        print("[batch] soft-infra-cooldown-sec phải >= 0.", file=sys.stderr, flush=True)
+        return 1
+    if args.device_start_gap_sec < 0:
+        print("[batch] device-start-gap-sec phải >= 0.", file=sys.stderr, flush=True)
         return 1
     try:
         device_ids = resolve_device_ids(args.device_id)
@@ -183,25 +205,18 @@ def main() -> int:
 
     failures: list[tuple[int, int]] = []
     success_durations: list[float] = []
+    disabled_devices: set[str] = set()
+    device_infra_errors: dict[str, int] = {device_id: 0 for device_id in device_ids}
     batch_start = time.monotonic()
     print_lock = threading.Lock()
     result_lock = threading.Lock()
     stop_all = threading.Event()
     total_tasks = len(tasks)
-    task_queues: dict[str, queue.Queue[dict]] = {device_id: queue.Queue() for device_id in device_ids}
-    queued_per_device = {device_id: 0 for device_id in device_ids}
-    rr = 0
+    task_queue: queue.Queue[dict] = queue.Queue()
     for task in tasks:
-        preferred = str(task.get("device_id") or "")
-        if preferred in task_queues:
-            target = preferred
-        else:
-            target = device_ids[rr % len(device_ids)]
-            rr += 1
         queued_task = dict(task)
-        queued_task["container_mode"] = "active-then-create" if queued_per_device[target] == 0 else "create"
-        queued_per_device[target] += 1
-        task_queues[target].put(queued_task)
+        queued_task["container_mode"] = "create"
+        task_queue.put(queued_task)
 
     def log(line: str = "") -> None:
         with print_lock:
@@ -226,8 +241,8 @@ def main() -> int:
             "--container-mode",
             container_mode,
         ]
-        if args.no_reload:
-            cmd.append("--no-reload")
+        if args.reload_crane:
+            cmd.append("--reload-crane")
         if args.no_submit:
             cmd.append("--no-submit")
 
@@ -268,38 +283,93 @@ def main() -> int:
     counter_lock = threading.Lock()
     counter = {"value": 0}
 
-    def worker(device_id: str) -> None:
+    def has_hint(output: str, hints: tuple[str, ...]) -> bool:
+        return any(hint in output for hint in hints)
+
+    def worker(device_id: str, worker_index: int) -> None:
+        start_delay = worker_index * args.device_start_gap_sec
+        if start_delay > 0:
+            log(f"[batch][{device_label(device_id)}] chờ {start_delay:.1f}s để giãn tải USB/Frida lúc bắt đầu.")
+            time.sleep(start_delay)
         while not stop_all.is_set():
             try:
-                task = task_queues[device_id].get_nowait()
+                task = task_queue.get_nowait()
             except queue.Empty:
                 return
             with counter_lock:
                 counter["value"] += 1
                 index = counter["value"]
             row = int(task["row"])
-            container_mode = str(task.get("container_mode") or "active-then-next")
+            container_mode = str(task.get("container_mode") or "create")
             final_code, final_output, row_elapsed = run_task(device_id, index, row, container_mode)
             label = device_label(device_id)
+            cooldown_after = 0.0
             with result_lock:
                 if final_code != 0:
-                    failures.append((row, final_code))
-                    if any(hint in final_output for hint in STOP_ON_ERROR_HINTS):
+                    if has_hint(final_output, GLOBAL_ERROR_HINTS):
+                        failures.append((row, final_code))
                         stop_all.set()
-                        log(f"[batch][{label}] Dừng batch vì lỗi hạ tầng ở row {row} sau {args.max_attempts} attempt.")
+                        log(f"[batch][{label}] Dừng batch vì lỗi chung ở row {row} sau {args.max_attempts} attempt.")
+                    elif has_hint(final_output, HARD_DEVICE_LOST_HINTS):
+                        device_infra_errors[device_id] = device_infra_errors.get(device_id, 0) + 1
+                        failures.append((row, final_code))
+                        log(
+                            f"[batch][{label}] Device mất Frida/USB ở row {row} "
+                            f"({device_infra_errors[device_id]}/{args.device_error_threshold}); "
+                            "không requeue row này."
+                        )
+                        if device_infra_errors[device_id] >= args.device_error_threshold:
+                            disabled_devices.add(device_id)
+                            log(
+                                f"[batch][{label}] Loại device khỏi lượt chạy vì mất Frida/USB "
+                                f"{device_infra_errors[device_id]} lần liên tiếp."
+                            )
+                            return
+                    elif has_hint(final_output, ROW_INFRA_ERROR_HINTS):
+                        failures.append((row, final_code))
+                        cooldown_after = args.soft_infra_cooldown_sec
+                        log(
+                            f"[batch][{label}] Row {row} lỗi hạ tầng tạm thời "
+                            f"(Crane/DDI/connection); không requeue row này, nghỉ {cooldown_after:.1f}s rồi chạy tiếp."
+                        )
                     else:
+                        failures.append((row, final_code))
                         log(f"[batch][{label}] Row {row} lỗi exit={final_code} sau {args.max_attempts} attempt, chuyển row tiếp theo.")
                 else:
+                    device_infra_errors[device_id] = 0
                     success_durations.append(row_elapsed)
                     avg = sum(success_durations) / len(success_durations)
                     log(f"[batch][{label}] Row {row} xong trong {row_elapsed:.1f}s | trung bình {avg:.1f}s/nick")
+            if cooldown_after > 0 and not stop_all.is_set():
+                time.sleep(cooldown_after)
 
-    threads = [threading.Thread(target=worker, args=(device_id,), daemon=True) for device_id in device_ids]
+    threads = [
+        threading.Thread(target=worker, args=(device_id, index), daemon=True)
+        for index, device_id in enumerate(device_ids)
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
+    remaining_rows: list[int] = []
+    while True:
+        try:
+            remaining_task = task_queue.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            remaining_rows.append(int(remaining_task.get("row")))
+        except (TypeError, ValueError):
+            continue
+
+    if disabled_devices:
+        labels = ", ".join(device_label(device_id) for device_id in sorted(disabled_devices))
+        print(f"\n[batch] Đã loại {len(disabled_devices)} device mất Frida/USB khỏi lượt chạy: {labels}", flush=True)
+    if remaining_rows:
+        preview = ", ".join(str(row) for row in remaining_rows[:20])
+        suffix = "..." if len(remaining_rows) > 20 else ""
+        print(f"[batch] Còn {len(remaining_rows)} row chưa chạy do hết device khả dụng: {preview}{suffix}", flush=True)
     if failures:
         detail = ", ".join(f"row {row}: exit {code}" for row, code in failures[:10])
         more = "..." if len(failures) > 10 else ""

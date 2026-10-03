@@ -293,7 +293,7 @@ class YamadaRegGUI(tk.Tk):
 
     def _prepare_commands(self, row_args: list[str]) -> list[list[str]]:
         crane_cmd = [self._py(), "scripts/crane_container_manager.py", "ensure-row", *row_args]
-        crane_cmd.extend(["--device-id", self._single_device_id()])
+        crane_cmd.extend(["--device-id", self._single_device_id(), "--container-mode", "create"])
         if self.vars["no_reload"].get():
             crane_cmd.append("--no-reload")
         return [crane_cmd, self._profile_command(row_args)]
@@ -356,7 +356,6 @@ class YamadaRegGUI(tk.Tk):
             self._py(),
             "scripts/fetch_yamada_email_otp.py",
             *row_args,
-            "--write-excel",
             "--profile-js",
             str(ROOT_DIR / "agents" / "current_profile.js"),
         ]

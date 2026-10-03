@@ -322,10 +322,27 @@ function pageProgram(profile, options, mode) {
       absentSelectors: ['input[name="inputcode"]']
     },
     {
+      state: "email_already_registered_login",
+      urlIncludes: ["module=memberlogin", "action=regauth"],
+      titleIncludes: ["メールアドレス登録"],
+      bodyIncludes: ["メールアドレス登録エラー", "ご登録済みのメールアドレス", "ログインボタン"],
+      requiredSelectors: [
+        "body#mainchange",
+        'a[href*="module=memberlogin"][href*="action=regauth"][href*="func=cancel"]'
+      ]
+    },
+    {
       state: "unexpected_error_restart",
       titleIncludes: ["ヤマダアプリ"],
       bodyIncludes: ["予期せぬエラー", "最初からやり直してください"],
       requiredSelectors: ['a[href*="module=authorize"][href*="action=authorize2"]']
+    },
+    {
+      state: "temporary_member_registration_in_progress",
+      urlIncludes: ["module=changephone", "action=chgauth"],
+      titleIncludes: ["ログイン"],
+      bodyIncludes: ["仮会員", "会員登録が正常に完了しなかった", "仮会員の退会"],
+      requiredSelectors: ["body#mainchange", 'input[value="アプリトップへ"]']
     },
     {
       state: "email_auth_code_input",
@@ -440,7 +457,17 @@ function pageProgram(profile, options, mode) {
   }
 
   const currentScreen = screenInfo();
-  const state = currentScreen.state;
+  let state = currentScreen.state;
+  const pageText = text(document.body);
+  if (state === "unknown") {
+    const looksLikeAuthCode =
+      !!q('input[name="inputcode"]') ||
+      ((location.href || "").indexOf("action=regauth") >= 0 && pageText.indexOf("認証コード") >= 0);
+    if (looksLikeAuthCode) {
+      state = "email_auth_code_input";
+      currentScreen.state = state;
+    }
+  }
   if (mode === "detect") return JSON.stringify(result(state, "detect", { screen: currentScreen }));
   if (mode === "screen") return JSON.stringify(currentScreen);
 
@@ -489,18 +516,36 @@ function pageProgram(profile, options, mode) {
       submitButton(form);
       return JSON.stringify(result(state, "send_auth_email"));
     }
+    case "email_already_registered_login": {
+      return JSON.stringify(result(state, "already_logged_in_home", {
+        already_logged_in: true,
+        reason: "email_already_registered"
+      }));
+    }
     case "unexpected_error_restart": {
       const link = q('a[href*="module=authorize"][href*="action=authorize2"]');
       if (!options.dryRun && options.submit !== false) clickElement(link);
       return JSON.stringify(result(state, "restart_after_unexpected_error"));
+    }
+    case "temporary_member_registration_in_progress": {
+      return JSON.stringify(result(state, "fail_no_retry", {
+        ok: false,
+        failNoRetry: true,
+        reason: "đang trong quá trình đăng ký ở máy khác",
+        screen: currentScreen
+      }));
     }
     case "email_auth_code_input": {
       const authCode = val("auth_code", "authCode", "email_code", "emailCode", "inputcode", "otp");
       if (!authCode) {
         return JSON.stringify(result(state, "need_auth_code", { ok: false, wait: "auth_code" }));
       }
+      const input = q('input[name="inputcode"]');
+      if (!input) {
+        return JSON.stringify(result(state, "missing_auth_code_input", { ok: false, screen: currentScreen }));
+      }
       setField('input[name="inputcode"]', authCode);
-      submitButton(q('input[name="inputcode"]').form);
+      submitButton(input.form);
       return JSON.stringify(result(state, "fill_auth_code_and_submit"));
     }
     case "member_info_input": {

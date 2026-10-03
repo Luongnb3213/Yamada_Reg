@@ -35,7 +35,7 @@ Mở UI desktop tối giản kiểu `Neppi_Pay/gui.py`:
 python3 /Users/macbook/Desktop/FPT/Yamada_Reg/gui.py
 ```
 
-Trong UI, nút `Chạy row` sẽ tự gọi `ensure-row`, xuất profile, chạy DOM, tự lấy OTP email khi app tới màn nhập mã, rồi chạy tiếp. Nếu row chưa có `crane_container_id`, nó tự tịnh tiến từ active container sang container kế tiếp; nếu hết container có sẵn thì tự tạo container mới. Không cần gọi `next` thủ công trong luồng chạy.
+Trong UI, nút `Chạy row` sẽ tự gọi `ensure-row`, xuất profile, chạy DOM, tự lấy OTP email khi app tới màn nhập mã, rồi chạy tiếp. Nếu row chưa có `crane_container_id`, tool tự tạo container mới rồi chạy. Không cần gọi `next` thủ công trong luồng chạy.
 
 Ô `Wait màn (s)` điều khiển thời gian chờ mỗi lần app chuyển trang. Mặc định 15 giây; agent sẽ poll DOM tới khi state/url đổi thay vì sleep cứng.
 
@@ -45,7 +45,7 @@ Thứ tự test nhanh: chọn Excel, sheet, row rồi bấm `Chạy row`. Nếu 
 
 Workbook đầu vào dùng 3 sheet provider như Neppi: `Outlooks`, `Gmails`, `Iclouds`. Mỗi sheet dùng các cột:
 
-`email`, `pin`, `phone`, `last_name`, `first_name`, `last_name_kana`, `first_name_kana`, `postal_code`, `prefecture`, `city`, `address_rest`, `dob`, `gender`, `password`, `auth_code`, `otp_inbox`, `otp_password`, `otp_imap_host`, `crane_container_id`, `crane_container_name`, `crane_status`, `crane_assigned_at`, `crane_last_used_at`, `status`, `error_details`, `notes`.
+`email`, `pin`, `phone`, `last_name`, `first_name`, `last_name_kana`, `first_name_kana`, `postal_code`, `prefecture`, `city`, `address_rest`, `dob`, `gender`, `password`, `otp_inbox`, `otp_password`, `otp_imap_host`, `crane_container_id`, `crane_container_name`, `crane_status`, `crane_assigned_at`, `crane_last_used_at`, `status`, `error_details`, `notes`.
 
 `email` dùng luôn cho ô email nhập lại trên form. `dob` dùng dạng `YYYYMMDD`.
 
@@ -80,7 +80,7 @@ python3 /Users/macbook/Desktop/FPT/Yamada_Reg/scripts/crane_container_manager.py
   --row 2
 ```
 
-Nếu dòng đó đã có `crane_container_id`, script chỉ switch lại container đó. Nếu chưa có, mặc định script lấy container đang active, tịnh tiến sang container kế tiếp, reload Yamada, rồi ghi lại Excel. `DEFAULT` được bỏ qua khi tịnh tiến. Nếu đang ở container cuối thì script tự tạo container mới.
+Nếu dòng đó đã có `crane_container_id`, script chỉ switch lại container đó. Nếu chưa có, mặc định script tạo container mới, reload Yamada, rồi ghi lại Excel.
 
 Nếu muốn tạo mới thay vì dùng container có sẵn:
 
@@ -107,13 +107,12 @@ Mail OTP Yamada lọc theo sender `noreply@tpgaw.jp`; mail hoàn tất có thể
 
 IMAP tự nhận domain phổ biến như Gmail, Outlook/Hotmail/Live, iCloud/Me/Mac, Yahoo, AOL, Zoho, GMX, Yandex, Mail.ru. Với domain lạ, điền `otp_imap_host` trong Excel hoặc truyền `--imap-host`. Excel nhận cả tên cột kiểu Neppi `otp_email`/`otp_pass`; tool tự map sang `otp_inbox`/`otp_password`.
 
-Lấy OTP cho dòng Excel, ghi `auth_code` lại vào Excel và tạo lại `current_profile.js`:
+Lấy OTP cho dòng Excel và tạo lại `current_profile.js`. OTP không được ghi lại vào Excel:
 
 ```bash
 python3 /Users/macbook/Desktop/FPT/Yamada_Reg/scripts/fetch_yamada_email_otp.py \
   --xlsx /path/to/input.xlsx \
   --row 2 \
-  --write-excel \
   --profile-js /Users/macbook/Desktop/FPT/Yamada_Reg/agents/current_profile.js
 ```
 

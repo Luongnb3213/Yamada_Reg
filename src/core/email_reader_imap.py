@@ -6,7 +6,7 @@ import imaplib
 import re
 import time
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import Message
 from imaplib import IMAP4
 
@@ -174,6 +174,16 @@ def _mailbox_priority(name: str) -> tuple[int, str]:
     return (3, lower)
 
 
+def _scan_mailboxes(names: list[str]) -> list[str]:
+    import src.config as config
+
+    include_all = bool(getattr(config, "EMAIL_IMAP_INCLUDE_ALL_MAIL", False))
+    if include_all:
+        return names
+    primary = [name for name in names if _mailbox_priority(name)[0] <= 1]
+    return primary or names[:1]
+
+
 def _list_mailboxes(mail: IMAP4) -> list[str]:
     names = ["INBOX"]
     try:
@@ -193,6 +203,95 @@ def _message_key(mailbox: str, num: bytes, msg: Message) -> str:
     if msg_id:
         return msg_id
     return f"{mailbox}:{num.decode(errors='replace') if isinstance(num, bytes) else num}"
+
+
+def _imap_date(ts: float) -> str:
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%d-%b-%Y")
+
+
+def _gmail_raw_date(ts: float) -> str:
+    if not ts:
+        return ""
+    # Gmail's X-GM-RAW newer:/after: date handling is day-granular and can
+    # exclude messages from the same local day. Search from the previous day,
+    # then keep the strict second-level cutoff with the message Date header.
+    return (datetime.fromtimestamp(ts) - timedelta(days=1)).strftime("%Y/%m/%d")
+
+
+def _quote_search_value(value: str) -> str:
+    escaped = str(value or "").replace("\\", "\\\\").replace('"', r"\"")
+    return f'"{escaped}"'
+
+
+def _sender_search_criteria(senders: list[str]) -> list[str]:
+    if not senders:
+        return []
+    if len(senders) == 1:
+        return ["FROM", _quote_search_value(senders[0])]
+    criteria = ["OR", "FROM", _quote_search_value(senders[0]), "FROM", _quote_search_value(senders[1])]
+    for sender in senders[2:]:
+        criteria = ["OR", "FROM", _quote_search_value(sender), *criteria]
+    return criteria
+
+
+def _search_attempts(since_ts: float, senders: list[str]) -> list[list[str]]:
+    import src.config as config
+
+    since_date = _imap_date(since_ts)
+    sender_criteria = _sender_search_criteria(senders)
+    broad_fallback = bool(getattr(config, "EMAIL_IMAP_BROAD_FALLBACK", False))
+    attempts: list[list[str]] = []
+    if since_date and sender_criteria:
+        attempts.append(["SINCE", since_date, *sender_criteria])
+    if since_date and (not sender_criteria or broad_fallback):
+        attempts.append(["SINCE", since_date])
+    if not since_date and sender_criteria:
+        attempts.append(sender_criteria)
+    if not since_date and (not sender_criteria or broad_fallback):
+        attempts.append(["ALL"])
+
+    unique: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for attempt in attempts:
+        key = tuple(attempt)
+        if key not in seen:
+            seen.add(key)
+            unique.append(attempt)
+    return unique
+
+
+def _search_messages(mail: IMAP4, since_ts: float, senders: list[str]) -> tuple[str, list[bytes]]:
+    for criteria in _search_attempts(since_ts, senders):
+        try:
+            status, messages = mail.search(None, *criteria)
+        except Exception as exc:
+            log.debug("IMAP search lỗi với criteria=%s: %s", criteria, exc)
+            continue
+        if status == "OK" and messages and messages[0]:
+            return status, messages[0].split()
+    return "OK", []
+
+
+def _gmail_raw_search_messages(mail: IMAP4, target_email: str, since_ts: float) -> list[bytes]:
+    target = str(target_email or "").strip()
+    if not target:
+        return []
+    parts = []
+    newer = _gmail_raw_date(since_ts)
+    if newer:
+        parts.append(f"newer:{newer}")
+    parts.append(target)
+    query = " ".join(parts)
+    try:
+        status, messages = mail.uid("SEARCH", None, "X-GM-RAW", f'"{query}"')
+    except Exception as exc:
+        log.debug("[%s] Gmail raw search lỗi: %s", target, exc)
+        return []
+    if status != "OK" or not messages or not messages[0]:
+        return []
+    return messages[0].split()
 
 
 def get_email_otp_imap(
@@ -223,28 +322,54 @@ def get_email_otp_imap(
         for item in re.split(r"[,;]", str(from_filter or ""))
         if item.strip()
     ]
-    search_expr = f'(FROM "{senders[0]}")' if len(senders) == 1 else "ALL"
     deadline = time.time() + timeout
-    log.info("[%s] Chờ OTP từ %s qua %s, quét tất cả mailbox.", target_email, inbox, imap_server)
     seen_messages: set[str] = set()
+    import src.config as config
+    socket_timeout = int(getattr(config, "EMAIL_IMAP_SOCKET_TIMEOUT", 20) or 20)
+    max_messages = int(getattr(config, "EMAIL_IMAP_MAX_MESSAGES", 80) or 80)
+    log.info(
+        "[%s] Chờ OTP từ %s qua %s, timeout=%ss, socket_timeout=%ss, max_messages=%s.",
+        target_email,
+        inbox,
+        imap_server,
+        timeout,
+        socket_timeout,
+        max_messages,
+    )
 
     while time.time() < deadline:
+        mail = None
         try:
-            mail = imaplib.IMAP4_SSL(imap_server)
+            mail = imaplib.IMAP4_SSL(imap_server, timeout=socket_timeout)
             mail.login(inbox, password)
-            mailboxes = _list_mailboxes(mail)
+            mailboxes = _scan_mailboxes(_list_mailboxes(mail))
+            candidates: list[tuple[float, int, str, str]] = []
             for mailbox in mailboxes:
+                if time.time() >= deadline:
+                    break
                 try:
                     selected, _ = mail.select(f'"{mailbox}"', readonly=True)
                     if selected != "OK":
                         continue
                 except Exception:
                     continue
-                status, messages = mail.search(None, search_expr)
-                if status != "OK" or not messages or not messages[0]:
+                use_uid_fetch = False
+                message_nums = _gmail_raw_search_messages(mail, target_email, since_ts)
+                if message_nums:
+                    use_uid_fetch = True
+                if not message_nums:
+                    status, message_nums = _search_messages(mail, since_ts, senders)
+                    if status != "OK":
+                        continue
+                if not message_nums:
                     continue
-                for num in reversed(messages[0].split()[-50:]):
-                    res, msg_data = mail.fetch(num, "(BODY.PEEK[])")
+                for num in reversed(message_nums[-max_messages:]):
+                    if time.time() >= deadline:
+                        break
+                    if use_uid_fetch:
+                        res, msg_data = mail.uid("FETCH", num, "(BODY.PEEK[])")
+                    else:
+                        res, msg_data = mail.fetch(num, "(BODY.PEEK[])")
                     if res != "OK":
                         continue
                     raw = next((part[1] for part in msg_data if isinstance(part, tuple)), None)
@@ -255,7 +380,8 @@ def get_email_otp_imap(
                     if key in seen_messages:
                         continue
                     seen_messages.add(key)
-                    if since_ts and _message_ts(msg) < since_ts:
+                    msg_ts = _message_ts(msg)
+                    if since_ts and msg_ts < since_ts:
                         continue
                     if not _sender_matches(from_filter, msg):
                         continue
@@ -264,15 +390,30 @@ def get_email_otp_imap(
                         continue
                     code = _extract_code(body, code_pattern=code_pattern)
                     if code:
-                        mail.logout()
-                        log.info("[%s] Đã tìm thấy OTP qua IMAP trong mailbox %s.", target_email, mailbox)
-                        return code
-            mail.logout()
+                        try:
+                            seq = int(num)
+                        except (TypeError, ValueError):
+                            seq = 0
+                        candidates.append((msg_ts, seq, mailbox, code))
+            try:
+                mail.logout()
+            except Exception:
+                pass
+            if candidates:
+                candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                _, _, mailbox, code = candidates[0]
+                log.info("[%s] Đã tìm thấy OTP mới nhất qua IMAP trong mailbox %s.", target_email, mailbox)
+                return code
         except imaplib.IMAP4.error as exc:
             log.error("[%s] Lỗi đăng nhập IMAP %s: %s", target_email, inbox, exc)
             return ""
         except Exception as exc:
             log.debug("[%s] Lỗi đọc IMAP tạm thời: %s", target_email, exc)
+            if mail is not None:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
         time.sleep(poll_interval)
 
     log.warning("[%s] Hết thời gian chờ OTP qua IMAP.", target_email)

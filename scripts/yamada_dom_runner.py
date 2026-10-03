@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from spawn_throttle import spawn_slot
+
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_FRIDA_PYTHON = "/Users/macbook/Library/Application Support/pipx/venvs/frida-tools/bin/python"
@@ -135,8 +138,71 @@ def app_pid(device, bundle_id: str) -> int | None:
     return None
 
 
+def wait_app_stopped(device, bundle_id: str, timeout_sec: float, poll_sec: float = 0.25) -> bool:
+    deadline = time.time() + max(0, timeout_sec)
+    while time.time() < deadline:
+        if not app_pid(device, bundle_id):
+            return True
+        time.sleep(max(0.05, poll_sec))
+    return not app_pid(device, bundle_id)
+
+
+def kill_running_app(device, bundle_id: str, timeout_sec: float) -> None:
+    pid = app_pid(device, bundle_id)
+    if not pid:
+        return
+    try:
+        device.kill(pid)
+        print(f"[yamada-dom] Đã kill app {bundle_id} pid={pid} trước khi spawn mới.", file=sys.stderr)
+    except Exception as exc:
+        print(f"[yamada-dom] Kill app {bundle_id} pid={pid} lỗi tạm: {exc}", file=sys.stderr)
+    if not wait_app_stopped(device, bundle_id, timeout_sec):
+        print(f"[yamada-dom] App {bundle_id} vẫn còn pid sau khi chờ tắt.", file=sys.stderr)
+
+
+def spawn_attach_resume(device, args: argparse.Namespace, errors: list[str]):
+    last_exc: Exception | None = None
+    attempts = max(1, int(args.spawn_attempts))
+    backoff = max(0.0, float(args.spawn_backoff_sec))
+    for attempt in range(1, attempts + 1):
+        pid = None
+        try:
+            with spawn_slot(slots=args.spawn_slots, label=f"dom {args.bundle_id}"):
+                pid = device.spawn([args.bundle_id])
+                session = device.attach(pid)
+                device.resume(pid)
+            print(f"[yamada-dom] Đã mở app {args.bundle_id} pid={pid}.", file=sys.stderr)
+            time.sleep(max(0, float(args.launch_wait)))
+            return session, True
+        except Exception as exc:
+            last_exc = exc
+            errors.append(f"spawn app {args.bundle_id} attempt {attempt}/{attempts}: {exc}")
+            if pid:
+                try:
+                    device.kill(pid)
+                except Exception:
+                    pass
+            if attempt < attempts:
+                print(
+                    f"[yamada-dom] Spawn app lỗi tạm ({attempt}/{attempts}): {exc}; chờ {backoff:.1f}s rồi thử lại.",
+                    file=sys.stderr,
+                )
+                time.sleep(backoff)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("spawn failed")
+
+
 def attach_or_launch(device, args: argparse.Namespace):
     errors: list[str] = []
+
+    if args.fresh_launch and args.bundle_id:
+        kill_running_app(device, args.bundle_id, args.kill_wait_sec)
+        try:
+            return spawn_attach_resume(device, args, errors)
+        except Exception as exc:
+            errors.append(f"fresh spawn app {args.bundle_id}: {exc}")
+            raise RuntimeError("Không attach/mở được Yamada app. " + " | ".join(errors))
 
     if args.process:
         try:
@@ -157,12 +223,7 @@ def attach_or_launch(device, args: argparse.Namespace):
 
     if args.bundle_id:
         try:
-            pid = device.spawn([args.bundle_id])
-            session = device.attach(pid)
-            device.resume(pid)
-            print(f"[yamada-dom] Đã mở app {args.bundle_id} pid={pid}.", file=sys.stderr)
-            time.sleep(max(0, float(args.launch_wait)))
-            return session, True
+            return spawn_attach_resume(device, args, errors)
         except Exception as exc:
             errors.append(f"spawn app {args.bundle_id}: {exc}")
 
@@ -234,7 +295,7 @@ def run_with_frida(args: argparse.Namespace) -> Any:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Attach to Yamada and run the Frida DOM registration agent.")
-    parser.add_argument("--process", default="yamadadenki")
+    parser.add_argument("--process", default="")
     parser.add_argument("--bundle-id", default=os.environ.get("YAMADA_APP_ID", DEFAULT_APP_ID))
     parser.add_argument("--device-id", default=os.environ.get("FRIDA_DEVICE_ID", "auto"))
     parser.add_argument("--profile-js", default=str(ROOT_DIR / "agents" / "current_profile.js"))
@@ -248,6 +309,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-wait", type=float, default=0.5)
     parser.add_argument("--launch-wait", type=float, default=5.0)
     parser.add_argument("--initial-wait-timeout-ms", type=int, default=15000)
+    parser.add_argument("--fresh-launch", action="store_true", help="Kill the app first, then spawn it fresh for a new Crane container.")
+    parser.add_argument("--spawn-attempts", type=int, default=4)
+    parser.add_argument("--spawn-backoff-sec", type=float, default=1.5)
+    parser.add_argument(
+        "--spawn-slots",
+        type=int,
+        default=None,
+        help="Số máy tối đa được spawn cùng lúc (mặc định lấy env YAMADA_SPAWN_SLOTS=3).",
+    )
+    parser.add_argument("--kill-wait-sec", type=float, default=5.0)
     parser.add_argument("--no-submit", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)

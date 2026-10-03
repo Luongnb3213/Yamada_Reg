@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,14 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from src.connections.xlsx_connection import excel_write_lock  # noqa: E402
+
+
+DUMP_DOM_PYTHON = "/Users/macbook/Library/Application Support/pipx/venvs/frida-tools/bin/python"
+DUMP_DOM_SCRIPT = Path("/Users/macbook/dump_dom.py")
+DUMP_DOM_OUT_DIR = ROOT_DIR / "logs" / "yamada_dom"
+UNRECOGNIZED_SCREEN_STATES = {"unknown", "no_webview_or_no_result", "bad_json_result"}
+NO_RETRY_SCREEN_STATES = {"temporary_member_registration_in_progress"}
+NO_RETRY_OTHER_DEVICE_DETAIL = "đang trong quá trình đăng ký ở máy khác"
 
 
 def quote_cmd(cmd: list[str]) -> str:
@@ -102,6 +111,18 @@ def first_dom_error(result: Any) -> str:
     return ""
 
 
+def no_retry_error_detail(result: Any) -> str:
+    for node in walk(result):
+        if not isinstance(node, dict):
+            continue
+        state = str(node.get("state") or "")
+        action = str(node.get("action") or "")
+        reason = str(node.get("reason") or "")
+        if state in NO_RETRY_SCREEN_STATES or node.get("failNoRetry") is True or action == "fail_no_retry":
+            return reason or NO_RETRY_OTHER_DEVICE_DETAIL
+    return ""
+
+
 def member_info_filled_without_submit(result: Any) -> bool:
     for node in walk(result):
         if isinstance(node, dict) and node.get("action") == "fill_member_info_no_submit":
@@ -112,6 +133,13 @@ def member_info_filled_without_submit(result: Any) -> bool:
 def maybe_complete(result: Any) -> bool:
     for node in walk(result):
         if isinstance(node, dict) and node.get("state") == "maybe_complete":
+            return True
+    return False
+
+
+def sent_auth_email(result: Any) -> bool:
+    for node in walk(result):
+        if isinstance(node, dict) and node.get("action") == "send_auth_email":
             return True
     return False
 
@@ -175,6 +203,90 @@ def print_dom_summary(result: Any, title: str) -> None:
         print(f"[dom] {idx}. {state} -> {action}{extra}", flush=True)
 
 
+def has_unrecognized_screen(result: Any) -> bool:
+    for node in walk(result):
+        if not isinstance(node, dict):
+            continue
+        state = str(node.get("state") or "")
+        action = str(node.get("action") or "")
+        if state in UNRECOGNIZED_SCREEN_STATES:
+            return True
+        if action == "no_action" and node.get("ok", True) is False:
+            return True
+    return False
+
+
+def stable_dump_device_id(device_id: str) -> str:
+    value = str(device_id or "").strip()
+    if value.lower() in ("", "auto", "all", "*"):
+        return ""
+    return value
+
+
+def profile_email(profile: dict, row: int) -> str:
+    raw = str(profile.get("email") or "").strip()
+    email = raw.split("|", 1)[0].strip()
+    return email or f"row_{row}"
+
+
+def dump_unrecognized_screen(args: argparse.Namespace, profile: dict, reason: str) -> str:
+    device_id = stable_dump_device_id(args.device_id)
+    if not device_id:
+        print(
+            "[dump-dom] Bỏ qua dump HTML vì device-id đang là auto/all, "
+            "không đảm bảo đúng máy khi chạy nhiều device.",
+            flush=True,
+        )
+        return ""
+    if not DUMP_DOM_SCRIPT.exists():
+        print(f"[dump-dom] Không thấy script dump DOM: {DUMP_DOM_SCRIPT}", flush=True)
+        return ""
+    if not Path(DUMP_DOM_PYTHON).exists():
+        print(f"[dump-dom] Không thấy Python Frida: {DUMP_DOM_PYTHON}", flush=True)
+        return ""
+
+    safe_device = re.sub(r"[^A-Za-z0-9_.-]+", "_", device_id)[:32] or "device"
+    tag = f"row_{args.row}_{safe_device}_{reason}"
+    cmd = [
+        DUMP_DOM_PYTHON,
+        str(DUMP_DOM_SCRIPT),
+        "0",
+        "--device-id",
+        device_id,
+        "--out-dir",
+        str(DUMP_DOM_OUT_DIR),
+        "--email",
+        profile_email(profile, args.row),
+        "--tag",
+        tag,
+    ]
+
+    print("\n--- Dump HTML màn chưa nhận diện ---", flush=True)
+    print("$ " + quote_cmd(cmd), flush=True)
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[dump-dom] Timeout khi dump HTML.", flush=True)
+        return ""
+
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if output.strip():
+        print(output, end="" if output.endswith("\n") else "\n", flush=True)
+    if completed.returncode != 0:
+        print(f"[dump-dom] Dump HTML lỗi exit={completed.returncode}.", flush=True)
+        return ""
+
+    match = re.search(r"->\s*(.+?\.html)\s*$", output, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
 def summarize_json_result(output: str) -> Any:
     result = parse_json_from_output(output)
     return result
@@ -220,7 +332,7 @@ def write_row_status(xlsx: Path, sheet_name: str, row: int, status: str, error_d
             wb.close()
 
 
-def build_dom_cmd(args: argparse.Namespace) -> list[str]:
+def build_dom_cmd(args: argparse.Namespace, *, fresh_launch: bool = False) -> list[str]:
     cmd = [
         sys.executable,
         "scripts/yamada_dom_runner.py",
@@ -237,6 +349,8 @@ def build_dom_cmd(args: argparse.Namespace) -> list[str]:
     ]
     if args.no_submit:
         cmd.append("--no-submit")
+    if fresh_launch:
+        cmd.append("--fresh-launch")
     return cmd
 
 
@@ -245,13 +359,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--xlsx", required=True)
     parser.add_argument("--sheet", default="Iclouds")
     parser.add_argument("--row", type=int, required=True)
-    parser.add_argument("--no-reload", action="store_true")
+    parser.add_argument("--no-reload", action="store_true", help="Deprecated/default. Do not ask Crane to reload the app after switching container.")
+    parser.add_argument("--reload-crane", action="store_true", help="Opt in to Crane reloadApplicationWithIdentifier after switching container.")
     parser.add_argument("--no-submit", action="store_true")
     parser.add_argument("--device-id", default=os.environ.get("FRIDA_DEVICE_ID", "auto"))
     parser.add_argument(
         "--container-mode",
         choices=["active-then-create", "active-then-next", "next-active", "create"],
-        default="active-then-create",
+        default="create",
     )
     parser.add_argument("--profile-js", default="")
     parser.add_argument("--wait-timeout-ms", type=int, default=15000)
@@ -263,6 +378,8 @@ def main() -> int:
     args = build_parser().parse_args()
     xlsx = Path(args.xlsx).expanduser()
     row_args = ["--xlsx", str(xlsx), "--sheet", args.sheet, "--row", str(args.row)]
+    profile: dict[str, Any] = {}
+    last_dom_result: Any = None
     if args.profile_js:
         profile_js = Path(args.profile_js).expanduser()
     else:
@@ -281,7 +398,7 @@ def main() -> int:
             "--container-mode",
             args.container_mode,
         ]
-        if args.no_reload:
+        if not args.reload_crane:
             crane_cmd.append("--no-reload")
         crane_output = run_cmd_output(crane_cmd, "Chuẩn bị container")
         crane_result = summarize_json_result(crane_output)
@@ -303,11 +420,14 @@ def main() -> int:
             "Đọc data từ Excel",
         )
         profile_result = summarize_json_result(profile_output)
-        profile = profile_result.get("profile") if isinstance(profile_result, dict) else {}
+        profile_value = profile_result.get("profile") if isinstance(profile_result, dict) else {}
+        profile = profile_value if isinstance(profile_value, dict) else {}
         print(f"[excel] email={profile.get('email') or ''} row={args.row}", flush=True)
 
-        first_output = run_cmd_output(build_dom_cmd(args), "Chạy DOM")
+        otp_request_since_ts = float(int(time.time()))
+        first_output = run_cmd_output(build_dom_cmd(args, fresh_launch=True), "Chạy DOM")
         first_result = parse_json_from_output(first_output)
+        last_dom_result = first_result
         print_dom_summary(first_result, "lượt đầu")
         error = first_dom_error(first_result)
         if error:
@@ -316,21 +436,26 @@ def main() -> int:
         final_result = first_result
         if needs_auth_code(first_result):
             print("\n[flow] App đang chờ OTP. Tự lấy OTP từ mailbox trong Excel...", flush=True)
+            otp_cmd = [
+                sys.executable,
+                "scripts/fetch_yamada_email_otp.py",
+                *row_args,
+            ]
+            if sent_auth_email(first_result):
+                otp_cmd.extend(["--since-ts", str(otp_request_since_ts)])
+            otp_cmd.extend([
+                "--profile-js",
+                str(profile_js),
+            ])
             otp_output = run_cmd_output(
-                [
-                    sys.executable,
-                    "scripts/fetch_yamada_email_otp.py",
-                    *row_args,
-                    "--write-excel",
-                    "--profile-js",
-                    str(profile_js),
-                ],
+                otp_cmd,
                 "Lấy OTP email",
             )
             otp_result = summarize_json_result(otp_output)
             print(f"[email] OTP={otp_result.get('auth_code') or '(không có)'}", flush=True)
             second_output = run_cmd_output(build_dom_cmd(args), "Chạy tiếp sau OTP")
             second_result = parse_json_from_output(second_output)
+            last_dom_result = second_result
             print_dom_summary(second_result, "sau OTP")
             final_result = second_result
             if needs_auth_code(second_result):
@@ -346,7 +471,7 @@ def main() -> int:
                 f"state={last.get('state') or '?'} action={last.get('action') or '?'}"
             )
 
-        status = "LOGGED_IN" if already_logged_in(final_result) else "SUCCESS"
+        status = "LOGG_IN" if already_logged_in(final_result) else "SUCCESS"
         write_row_status(xlsx, args.sheet, args.row, status, "")
         print(f"\n[flow] Xong lượt chạy row {args.row} lúc {datetime.now():%Y-%m-%d %H:%M:%S}", flush=True)
         return 0
@@ -354,7 +479,16 @@ def main() -> int:
         message = str(exc)
         if "Lấy OTP email lỗi" in message:
             message = "Không lấy được OTP email. Kiểm tra otp_email/otp_pass hoặc mail OTP chưa về."
-        write_row_status(xlsx, args.sheet, args.row, "FAILED", message)
+        status = "FAILED"
+        no_retry_detail = no_retry_error_detail(last_dom_result)
+        if no_retry_detail:
+            status = "FAIL_NO_RETRY"
+            message = no_retry_detail
+        if has_unrecognized_screen(last_dom_result):
+            dump_path = dump_unrecognized_screen(args, profile, "unknown_screen")
+            if dump_path:
+                message = f"{message} | dumped_html={dump_path}"
+        write_row_status(xlsx, args.sheet, args.row, status, message)
         print(f"[flow] Lỗi: {message}", file=sys.stderr, flush=True)
         return 1
 

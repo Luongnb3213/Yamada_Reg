@@ -21,9 +21,29 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 
+from spawn_throttle import spawn_slot
+
 DEFAULT_APP_ID = "jp.co.unisys.yamadamobile"
 DEFAULT_HOST = "com.opa334.CraneApplication"
 DEFAULT_FRIDA_PYTHON = "/Users/macbook/Library/Application Support/pipx/venvs/frida-tools/bin/python"
+
+# Lỗi hạ tầng tạm thời (frida-server chập chờn lúc nhiều máy spawn song song):
+# retry sau backoff thường qua được, vì bản thân máy vẫn khoẻ.
+TRANSIENT_SPAWN_HINTS = (
+    "developer disk image",
+    "connection is closed",
+    "connection closed",
+    "device not found",
+    "early end-of-stream",
+    "unable to find device",
+    "timed out",
+    "timeout",
+)
+
+
+def is_transient_spawn_error(message: str) -> bool:
+    low = (message or "").lower()
+    return any(hint in low for hint in TRANSIENT_SPAWN_HINTS)
 
 CRANE_COLUMNS = [
     "crane_container_id",
@@ -525,10 +545,11 @@ def resolve_frida_device(frida, device_id: str, timeout: int = 10):
 
 
 class CraneHostSession:
-    def __init__(self, device_id: str, host: str, keep_host: bool = False):
+    def __init__(self, device_id: str, host: str, keep_host: bool = False, spawn_slots: int | None = None):
         self.device_id = device_id
         self.host = host
         self.keep_host = keep_host
+        self.spawn_slots = spawn_slots
         self.frida = None
         self.device = None
         self.pid: int | None = None
@@ -542,8 +563,9 @@ class CraneHostSession:
         self.frida = frida
         self.device = resolve_frida_device(frida, self.device_id, timeout=10)
 
-        self.pid = self.device.spawn([self.host])
-        self.session = self.device.attach(self.pid)
+        with spawn_slot(slots=self.spawn_slots, label=f"crane {self.host}"):
+            self.pid = self.device.spawn([self.host])
+            self.session = self.device.attach(self.pid)
         self.script = self.session.create_script(CRANE_JS)
         self.script.on("message", self._on_message)
         self.script.load()
@@ -621,8 +643,28 @@ class CraneHostSession:
 
 def invoke_crane_rpc(args: argparse.Namespace, action: str, **kwargs) -> Any:
     if import_frida() is not None:
-        with CraneHostSession(args.device_id, args.host, args.keep_host) as crane:
-            return crane.call(action, args.app_id, **kwargs)
+        attempts = max(1, int(getattr(args, "spawn_attempts", 4) or 4))
+        backoff = max(0.0, float(getattr(args, "spawn_backoff_sec", 1.5) or 1.5))
+        slots = getattr(args, "spawn_slots", None)
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with CraneHostSession(args.device_id, args.host, args.keep_host, spawn_slots=slots) as crane:
+                    return crane.call(action, args.app_id, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts and is_transient_spawn_error(str(exc)):
+                    wait = backoff * attempt
+                    print(
+                        f"[crane] Spawn host lỗi tạm ({attempt}/{attempts}): {exc}; chờ {wait:.1f}s rồi thử lại.",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Crane RPC failed without an exception.")
 
     python_bin = find_frida_python()
     child_args = [
@@ -640,6 +682,10 @@ def invoke_crane_rpc(args: argparse.Namespace, action: str, **kwargs) -> Any:
     ]
     if args.keep_host:
         child_args.append("--keep-host")
+    for flag in ("spawn_attempts", "spawn_backoff_sec", "spawn_slots"):
+        value = getattr(args, flag, None)
+        if value is not None:
+            child_args.extend([f"--{flag.replace('_', '-')}", str(value)])
     for key, value in kwargs.items():
         if value is None:
             continue
@@ -970,6 +1016,14 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default=os.environ.get("CRANE_HOST", DEFAULT_HOST))
     parser.add_argument("--device-id", default=os.environ.get("FRIDA_DEVICE_ID", "auto"))
     parser.add_argument("--keep-host", action="store_true", help="Do not kill the frozen Crane host process on exit.")
+    parser.add_argument("--spawn-attempts", type=int, default=4, help="Số lần thử spawn Crane host khi gặp lỗi hạ tầng tạm thời.")
+    parser.add_argument("--spawn-backoff-sec", type=float, default=1.5, help="Backoff cơ sở giữa các lần retry (tăng dần theo số lần).")
+    parser.add_argument(
+        "--spawn-slots",
+        type=int,
+        default=None,
+        help="Số máy tối đa được spawn cùng lúc (mặc định lấy env YAMADA_SPAWN_SLOTS=3).",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1013,7 +1067,7 @@ def build_parser() -> argparse.ArgumentParser:
     ensure_excel.add_argument(
         "--container-mode",
         choices=["active-then-create", "active-then-next", "next-active", "create"],
-        default="active-then-next",
+        default="create",
     )
     ensure_excel.add_argument("--include-default", action="store_true")
     ensure_excel.add_argument("--wrap-containers", action="store_true")
