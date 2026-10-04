@@ -21,7 +21,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 
-from spawn_throttle import spawn_slot
+from spawn_throttle import crane_slots_default, spawn_slot
 
 DEFAULT_APP_ID = "jp.co.unisys.yamadamobile"
 DEFAULT_HOST = "com.opa334.CraneApplication"
@@ -563,9 +563,10 @@ class CraneHostSession:
         self.frida = frida
         self.device = resolve_frida_device(frida, self.device_id, timeout=10)
 
-        with spawn_slot(slots=self.spawn_slots, label=f"crane {self.host}"):
-            self.pid = self.device.spawn([self.host])
-            self.session = self.device.attach(self.pid)
+        # Slot throttle bọc Ở NGOÀI (invoke_crane_rpc) để giữ slot suốt cả vòng
+        # đời phiên (spawn -> thao tác -> kill), không chỉ lúc spawn.
+        self.pid = self.device.spawn([self.host])
+        self.session = self.device.attach(self.pid)
         self.script = self.session.create_script(CRANE_JS)
         self.script.on("message", self._on_message)
         self.script.load()
@@ -646,10 +647,14 @@ def invoke_crane_rpc(args: argparse.Namespace, action: str, **kwargs) -> Any:
         attempts = max(1, int(getattr(args, "spawn_attempts", 4) or 4))
         backoff = max(0.0, float(getattr(args, "spawn_backoff_sec", 1.5) or 1.5))
         slots = getattr(args, "spawn_slots", None)
+        crane_slots = int(slots) if slots is not None else crane_slots_default()
         last_exc: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                with CraneHostSession(args.device_id, args.host, args.keep_host, spawn_slots=slots) as crane:
+                # Giữ slot suốt cả phiên Crane (spawn+thao tác+kill) để tối đa
+                # `crane_slots` app Crane đông cứng cùng lúc -> không vượt watchdog.
+                with spawn_slot(slots=crane_slots, pool="crane", label=f"crane {args.device_id[:8]}"), \
+                        CraneHostSession(args.device_id, args.host, args.keep_host, spawn_slots=None) as crane:
                     return crane.call(action, args.app_id, **kwargs)
             except Exception as exc:
                 last_exc = exc

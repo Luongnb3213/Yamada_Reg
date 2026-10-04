@@ -3,5 +3,14 @@
   "active_sheet": "Iclouds",
   "run_limit": 0,
   "wait_seconds": 15,
-  "device_id": "auto"
+  "device_id": "auto",
+  "respring_every": 30,
+  "weak_respring_every": 15,
+  "weak_devices": "64dda6c0,5f5b,805deacc",
+  "respring_compressor_mb": 800,
+  "respring_cooldown_sec": 5,
+  "row_timeout_sec": 180,
+  "log_compressor": true,
+  "spawn_slots": 3,
+  "crane_slots": 2
 }

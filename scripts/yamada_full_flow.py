@@ -5,8 +5,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +30,9 @@ DUMP_DOM_OUT_DIR = ROOT_DIR / "logs" / "yamada_dom"
 UNRECOGNIZED_SCREEN_STATES = {"unknown", "no_webview_or_no_result", "bad_json_result"}
 NO_RETRY_SCREEN_STATES = {"temporary_member_registration_in_progress"}
 NO_RETRY_OTHER_DEVICE_DETAIL = "đang trong quá trình đăng ký ở máy khác"
+# Bước DOM nào im lặng quá ngần này giây coi như WebView bị treo -> kill + force-kill app.
+# Nhanh hơn watchdog 180s ở tầng batch; chỉ áp cho 2 bước drive WebView qua frida RPC.
+DOM_IDLE_TIMEOUT_SEC = float(os.environ.get("YAMADA_DOM_IDLE_TIMEOUT_SEC", "90") or 90)
 
 
 def quote_cmd(cmd: list[str]) -> str:
@@ -38,7 +43,28 @@ def run_cmd(cmd: list[str], title: str) -> str:
     return run_cmd_output(cmd, title, stream=True)
 
 
-def run_cmd_output(cmd: list[str], title: str, stream: bool = False) -> str:
+def force_kill_app(device_id: str, bundle_id: str = "") -> None:
+    """Force-kill app Yamada trên 1 máy sau khi WebView treo, để nó không kẹt lại trên màn hình.
+
+    Chạy ở tiến trình riêng (frida client mới) nên không phụ thuộc session đã treo.
+    """
+    cmd = [sys.executable, "scripts/yamada_dom_runner.py", "--action", "kill", "--device-id", device_id]
+    if bundle_id:
+        cmd.extend(["--bundle-id", bundle_id])
+    try:
+        subprocess.run(cmd, cwd=str(ROOT_DIR), text=True, capture_output=True, timeout=30, check=False)
+        print(f"[flow] Đã force-kill app Yamada trên máy {device_id} sau khi treo.", flush=True)
+    except Exception as exc:
+        print(f"[flow] Force-kill app trên {device_id} lỗi (bỏ qua): {exc}", flush=True)
+
+
+def run_cmd_output(
+    cmd: list[str],
+    title: str,
+    stream: bool = False,
+    idle_timeout: float = 0.0,
+    kill_app_device: str = "",
+) -> str:
     print(f"\n--- {title} ---", flush=True)
     print("$ " + quote_cmd(cmd), flush=True)
     proc = subprocess.Popen(
@@ -48,15 +74,49 @@ def run_cmd_output(cmd: list[str], title: str, stream: bool = False) -> str:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
     assert proc.stdout is not None
     lines: list[str] = []
-    for line in proc.stdout:
-        lines.append(line)
-        if stream:
-            print(line, end="", flush=True)
-    code = proc.wait()
+    idle_fired = {"v": False}
+    last_activity = [time.monotonic()]
+    stop_watch = threading.Event()
+
+    def _watch(p=proc, flag=idle_fired, last=last_activity, stop=stop_watch, limit=idle_timeout):
+        while not stop.wait(5.0):
+            if time.monotonic() - last[0] > limit:
+                flag["v"] = True
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                return
+
+    watchdog = None
+    if idle_timeout and idle_timeout > 0:
+        watchdog = threading.Thread(target=_watch, daemon=True)
+        watchdog.start()
+    try:
+        for line in proc.stdout:
+            last_activity[0] = time.monotonic()
+            lines.append(line)
+            if stream:
+                print(line, end="", flush=True)
+        code = proc.wait()
+    finally:
+        stop_watch.set()
     output = "".join(lines)
+    if idle_fired["v"]:
+        print(
+            f"[flow] {title}: im lặng > {idle_timeout:.0f}s -> coi như treo WebView, đã kill cây tiến trình.",
+            flush=True,
+        )
+        if kill_app_device:
+            force_kill_app(kill_app_device)
+        raise RuntimeError(f"{title} treo (im lặng > {idle_timeout:.0f}s).")
     if code != 0:
         if not stream and output.strip():
             print(output.strip(), flush=True)
@@ -332,6 +392,42 @@ def write_row_status(xlsx: Path, sheet_name: str, row: int, status: str, error_d
             wb.close()
 
 
+def kill_app_best_effort(args: argparse.Namespace) -> None:
+    """Cuối mỗi row: kill app Yamada để xả webview (~150MB) ngay, cho compressor
+    hạ nhiệt trong khoảng nghỉ trước row sau. Không chờ tới row sau mới kill (như
+    kill-then-spawn cũ) để tránh máy luôn ôm 1 webview nặng -> cạn RAM -> launchd
+    panic -> reboot mất jailbreak. Best-effort: lỗi thì bỏ qua, không làm hỏng row."""
+    cmd = [
+        sys.executable,
+        "scripts/yamada_dom_runner.py",
+        "--action",
+        "kill",
+        "--device-id",
+        args.device_id,
+        "--ensure-killed",
+    ]
+    for attempt in (1, 2):
+        try:
+            done = subprocess.run(cmd, cwd=str(ROOT_DIR), text=True, capture_output=True, timeout=40, check=False)
+        except Exception as exc:
+            print(f"[flow] Kill app cuối row lỗi tạm (bỏ qua): {exc}", file=sys.stderr, flush=True)
+            return
+        try:
+            stopped = bool(parse_json_from_output(done.stdout or "").get("stopped"))
+        except Exception:
+            stopped = done.returncode == 0
+        if stopped:
+            print("[flow] Đã kill app Yamada cuối row để xả RAM.", flush=True)
+            return
+        if attempt == 1:
+            print("[flow] App Yamada chưa tắt sau kill, thử lại lần 2...", flush=True)
+    print(
+        "[flow] CẢNH BÁO: app Yamada có thể vẫn còn trên màn sau 2 lần kill cuối row.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def build_dom_cmd(args: argparse.Namespace, *, fresh_launch: bool = False) -> list[str]:
     cmd = [
         sys.executable,
@@ -371,6 +467,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-js", default="")
     parser.add_argument("--wait-timeout-ms", type=int, default=15000)
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument(
+        "--dom-idle-timeout-sec",
+        type=float,
+        default=DOM_IDLE_TIMEOUT_SEC,
+        help="Bước DOM im lặng quá ngần này giây coi như treo WebView: kill tiến trình + force-kill app. 0 = tắt.",
+    )
     return parser
 
 
@@ -425,7 +527,12 @@ def main() -> int:
         print(f"[excel] email={profile.get('email') or ''} row={args.row}", flush=True)
 
         otp_request_since_ts = float(int(time.time()))
-        first_output = run_cmd_output(build_dom_cmd(args, fresh_launch=True), "Chạy DOM")
+        first_output = run_cmd_output(
+            build_dom_cmd(args, fresh_launch=True),
+            "Chạy DOM",
+            idle_timeout=args.dom_idle_timeout_sec,
+            kill_app_device=args.device_id,
+        )
         first_result = parse_json_from_output(first_output)
         last_dom_result = first_result
         print_dom_summary(first_result, "lượt đầu")
@@ -453,7 +560,12 @@ def main() -> int:
             )
             otp_result = summarize_json_result(otp_output)
             print(f"[email] OTP={otp_result.get('auth_code') or '(không có)'}", flush=True)
-            second_output = run_cmd_output(build_dom_cmd(args), "Chạy tiếp sau OTP")
+            second_output = run_cmd_output(
+                build_dom_cmd(args),
+                "Chạy tiếp sau OTP",
+                idle_timeout=args.dom_idle_timeout_sec,
+                kill_app_device=args.device_id,
+            )
             second_result = parse_json_from_output(second_output)
             last_dom_result = second_result
             print_dom_summary(second_result, "sau OTP")
@@ -491,6 +603,8 @@ def main() -> int:
         write_row_status(xlsx, args.sheet, args.row, status, message)
         print(f"[flow] Lỗi: {message}", file=sys.stderr, flush=True)
         return 1
+    finally:
+        kill_app_best_effort(args)
 
 
 if __name__ == "__main__":

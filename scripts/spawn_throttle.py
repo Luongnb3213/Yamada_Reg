@@ -25,22 +25,36 @@ def _default_slots() -> int:
         return 3
 
 
-def _slot_dir() -> Path:
+def crane_slots_default() -> int:
+    """Số phiên Crane host đồng thời tối đa trên toàn farm (env YAMADA_CRANE_SLOTS,
+    mặc định 2). Để thấp hơn slot spawn thường vì app Crane bị spawn-đông-cứng:
+    nhiều phiên cùng lúc -> tranh CPU -> vượt watchdog ~20s -> iOS giết Crane ->
+    app Crane tụt đăng ký (FBSApplicationLibrary returned nil)."""
+    try:
+        return max(1, int(os.environ.get("YAMADA_CRANE_SLOTS", "2") or "2"))
+    except ValueError:
+        return 2
+
+
+def _slot_dir(pool: str = "") -> Path:
     override = os.environ.get("YAMADA_SPAWN_SLOT_DIR", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path(__file__).resolve().parents[1] / "agents" / "runtime" / "spawn_slots"
+    base = Path(override).expanduser() if override else (
+        Path(__file__).resolve().parents[1] / "agents" / "runtime" / "spawn_slots"
+    )
+    pool = (pool or "").strip()
+    return base / pool if pool else base
 
 
 @contextmanager
-def spawn_slot(slots: int | None = None, timeout: float = 120.0, poll: float = 0.2, label: str = ""):
+def spawn_slot(slots: int | None = None, timeout: float = 120.0, poll: float = 0.2, label: str = "", pool: str = ""):
     """Giữ 1 slot spawn trong khối `with`. Tối đa `slots` process giữ slot cùng lúc.
 
-    Fail-open: nếu quá `timeout` chưa lấy được slot thì chạy tiếp KHÔNG throttle,
-    để không bao giờ khoá chết cả farm vì một lock kẹt.
+    `pool` tách các nhóm slot độc lập (vd "crane" vs "dom") để không giành slot
+    lẫn nhau. Fail-open: nếu quá `timeout` chưa lấy được slot thì chạy tiếp KHÔNG
+    throttle, để không bao giờ khoá chết cả farm vì một lock kẹt.
     """
     n = max(1, int(slots if slots is not None else _default_slots()))
-    directory = _slot_dir()
+    directory = _slot_dir(pool)
     try:
         directory.mkdir(parents=True, exist_ok=True)
     except OSError:
